@@ -1,0 +1,12 @@
+{
+  "name": "agy-token-monitor",
+  "displayName": "Token 速度与额度监控 (Token Monitor)",
+  "version": "1.2.0",
+  "description": "Real-time Antigravity Token speed monitor (pure decode tok/s vs E2E TTFT), context window tracker, cache hit rate analyzer, and daily token quota calendar heatmap.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "打开 Token 速度监控侧边栏面板",
+    "分析当前会话的纯生成速度 (扣首字延迟) 与缓存命中率",
+    "查看每日 Token 额度日历看板与各模型消耗占比"
+  ]
+}

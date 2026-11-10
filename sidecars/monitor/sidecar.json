@@ -1,0 +1,18 @@
+{
+  "command": "node",
+  "args": ["main.mjs"],
+  "restart_policy": "always",
+  "display_name": "Token 速度监控",
+  "description": "实时监控 Antigravity 会话的 Token 吞吐速度 (tok/s)、上下文窗口水位、缓存命中率与每步耗时明细。",
+  "has_web_ui": true,
+  "ui_config": {
+    "display_name": "Token 速度监控",
+    "views": [
+      {
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "title": "Token 速度监控"
+      }
+    ]
+  }
+}

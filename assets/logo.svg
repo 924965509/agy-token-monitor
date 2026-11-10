@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" fill="none">
+  <rect x="12" y="12" width="104" height="104" rx="24" fill="#0F172A" stroke="#38BDF8" stroke-width="4"/>
+  <path d="M28 84 L48 64 L64 74 L84 42 L100 50" stroke="#38BDF8" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="84" cy="42" r="6" fill="#22D3EE"/>
+  <circle cx="100" cy="50" r="6" fill="#38BDF8"/>
+  <path d="M28 96 H100" stroke="#334155" stroke-width="4" stroke-linecap="round"/>
+  <rect x="28" y="28" width="38" height="18" rx="6" fill="#0284C7"/>
+  <text x="47" y="41" fill="#FFFFFF" font-family="system-ui, sans-serif" font-size="11" font-weight="700" text-anchor="middle">tok/s</text>
+</svg>
