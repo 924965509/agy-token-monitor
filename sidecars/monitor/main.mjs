@@ -24,13 +24,15 @@ try {
   // Fallback if node:sqlite is unavailable
 }
 
+const DAILY_STORE_SCHEMA_VERSION = 2;
+
 // Record exact completion mtime when a step is first observed at the tail of transcript.jsonl
 const stepFinishObservedMs = new Map();
 
-// Cache for per-session DB telemetry keyed by sessionId -> { mtimeMs, data }
+// Cache for per-session DB telemetry keyed by sessionId -> { mtimeMs, map }
 const dbTelemetryCache = new Map();
 
-// Cache for per-session daily usage keyed by sessionId -> { mtimeMs, daysMap }
+// Cache for per-session daily usage keyed by sessionId -> { mtimeMs, perDay }
 const sessionDailyCache = new Map();
 
 function getAppDataDir() {
@@ -81,6 +83,107 @@ function toLocalDateStr(isoOrMs) {
   const m = String(d.getMonth() + 1).padStart(2, '0');
   const day = String(d.getDate()).padStart(2, '0');
   return `${y}-${m}-${day}`;
+}
+
+/**
+ * Official API Pricing Table (USD per 1M tokens) matching Antigravity ModelPricingInfo
+ * Cache Read is 0.1x (90% discount) of base input price across Gemini & Claude.
+ */
+function getModelPricing(modelName, promptContextTokens = 0) {
+  const m = String(modelName || '').toLowerCase();
+  if (m.includes('opus')) {
+    return {
+      tier: 'Claude Opus',
+      inputPricePerM: 5.0,
+      cacheReadPricePerM: 0.5,
+      outputPricePerM: 25.0,
+    };
+  }
+  if (m.includes('sonnet') || m.includes('claude')) {
+    return {
+      tier: 'Claude Sonnet',
+      inputPricePerM: 3.0,
+      cacheReadPricePerM: 0.3,
+      outputPricePerM: 15.0,
+    };
+  }
+  if (m.includes('haiku')) {
+    return {
+      tier: 'Claude Haiku',
+      inputPricePerM: 1.0,
+      cacheReadPricePerM: 0.1,
+      outputPricePerM: 5.0,
+    };
+  }
+  if (/flash[\s-]*lite/.test(m)) {
+    return {
+      tier: 'Gemini Flash Lite',
+      inputPricePerM: 0.1,
+      cacheReadPricePerM: 0.01,
+      outputPricePerM: 0.4,
+    };
+  }
+  if (m.includes('flash')) {
+    return {
+      tier: 'Gemini Flash',
+      inputPricePerM: 0.3,
+      cacheReadPricePerM: 0.03,
+      outputPricePerM: 2.5,
+    };
+  }
+  // Gemini Pro / Carbon / Default (>200k tiered context pricing)
+  if (promptContextTokens > 200000) {
+    return {
+      tier: 'Gemini Pro (>200k)',
+      inputPricePerM: 4.0,
+      cacheReadPricePerM: 0.4,
+      outputPricePerM: 18.0,
+    };
+  }
+  return {
+    tier: 'Gemini Pro (≤200k)',
+    inputPricePerM: 2.0,
+    cacheReadPricePerM: 0.2,
+    outputPricePerM: 12.0,
+  };
+}
+
+/**
+ * Calculates per-step API quota cost (USD), cache savings, and weighted equivalent tokens
+ * (normalized to 1x base input token: Input*1 + Cache*0.1 + Output*(outPrice/inPrice)).
+ */
+function calcStepQuota(modelName, inputTokens, cacheTokens, outputTokens) {
+  const promptTokens = inputTokens + cacheTokens;
+  const pricing = getModelPricing(modelName, promptTokens);
+
+  const inputCostUsd = (inputTokens * pricing.inputPricePerM) / 1e6;
+  const cacheCostUsd = (cacheTokens * pricing.cacheReadPricePerM) / 1e6;
+  const outputCostUsd = (outputTokens * pricing.outputPricePerM) / 1e6;
+  const costUsd = inputCostUsd + cacheCostUsd + outputCostUsd;
+
+  const uncachedCostUsd =
+    (promptTokens * pricing.inputPricePerM + outputTokens * pricing.outputPricePerM) / 1e6;
+  const savedUsd = Math.max(0, uncachedCostUsd - costUsd);
+  const savedPct = uncachedCostUsd > 0 ? Math.round((savedUsd / uncachedCostUsd) * 100) : 0;
+
+  const cacheWeight = pricing.inputPricePerM > 0 ? pricing.cacheReadPricePerM / pricing.inputPricePerM : 0.1;
+  const outputWeight = pricing.inputPricePerM > 0 ? pricing.outputPricePerM / pricing.inputPricePerM : 6.0;
+  const equivTokens = Math.round(
+    inputTokens + cacheTokens * cacheWeight + outputTokens * outputWeight
+  );
+
+  return {
+    costUsd: Number(costUsd.toFixed(6)),
+    inputCostUsd: Number(inputCostUsd.toFixed(6)),
+    cacheCostUsd: Number(cacheCostUsd.toFixed(6)),
+    outputCostUsd: Number(outputCostUsd.toFixed(6)),
+    savedUsd: Number(savedUsd.toFixed(6)),
+    savedPct,
+    equivTokens,
+    cacheWeight: Number(cacheWeight.toFixed(2)),
+    outputWeight: Number(outputWeight.toFixed(1)),
+    pricing,
+  };
 }
 
 // --- Minimal Protobuf Decoder for conversations/<id>.db ---
@@ -138,7 +241,6 @@ function parseProtoDurationSec(buf) {
 
 /**
  * Reads exact per-step timing & token breakdown from ~/.gemini/antigravity/conversations/<sessionId>.db
- * Returns Map<stepIndex, { model, thinkingTokens, textTokens, f11Sec, f12Sec, totalSec }>
  */
 function getSessionDbTelemetry(sessionId, hintMtimeMs = 0) {
   if (!DatabaseSync || !sessionId) return new Map();
@@ -163,7 +265,6 @@ function getSessionDbTelemetry(sessionId, hintMtimeMs = 0) {
     const stepMap = new Map();
 
     try {
-      // 1. Read gen_metadata table
       const genRows = db.prepare('SELECT idx, data FROM gen_metadata ORDER BY idx ASC').all();
       const genByIdx = new Map();
 
@@ -202,12 +303,10 @@ function getSessionDbTelemetry(sessionId, hintMtimeMs = 0) {
         };
         genByIdx.set(r.idx, entry);
         if (lastStepIdx !== null && !Number.isNaN(lastStepIdx)) {
-          // Usually PLANNER_RESPONSE is lastStepIdx + 1
           stepMap.set(lastStepIdx + 1, entry);
         }
       }
 
-      // 2. Read steps table (step_type = 15 is PLANNER_RESPONSE) for exact step_index -> gen_metadata.idx mapping and exact timestamps
       const stepRows = db.prepare('SELECT idx, metadata FROM steps WHERE step_type = 15 ORDER BY idx ASC').all();
       for (const sr of stepRows) {
         if (!sr.metadata) continue;
@@ -299,22 +398,23 @@ function listSessions() {
 }
 
 /**
- * Aggregates daily token usage across all sessions in brainDir, cached by transcript mtimeMs
- * and persisted in ~/.gemini/antigravity/token_daily_history.json so deleted sessions aren't lost.
+ * Aggregates daily token & quota usage across all sessions in brainDir
  */
 function computeDailyUsage() {
   const brainDir = getBrainDir();
   const storePath = getDailyHistoryStorePath();
 
-  let persistentStore = { sessions: {} };
+  let persistentStore = { schemaVersion: DAILY_STORE_SCHEMA_VERSION, sessions: {} };
   try {
     if (fs.existsSync(storePath)) {
-      persistentStore = JSON.parse(fs.readFileSync(storePath, 'utf8')) || { sessions: {} };
+      const loaded = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+      if (loaded && loaded.schemaVersion === DAILY_STORE_SCHEMA_VERSION && loaded.sessions) {
+        persistentStore = loaded;
+      }
     }
   } catch {
-    persistentStore = { sessions: {} };
+    persistentStore = { schemaVersion: DAILY_STORE_SCHEMA_VERSION, sessions: {} };
   }
-  if (!persistentStore.sessions) persistentStore.sessions = {};
 
   let storeDirty = false;
 
@@ -339,7 +439,6 @@ function computeDailyUsage() {
           continue;
         }
 
-        // Parse this session's transcript
         const lines = fs.readFileSync(transcriptPath, 'utf8').split('\n').filter(Boolean);
         const dbMap = getSessionDbTelemetry(id, stat.mtimeMs);
         let currentModel = 'Gemini 4 Pro';
@@ -361,22 +460,31 @@ function computeDailyUsage() {
               const inp = Number(s.input_tokens || 0);
               const cac = Number(s.cache_read_tokens || 0);
               const out = Number(s.output_tokens || 0);
+              const quota = calcStepQuota(modelName, inp, cac, out);
 
               if (!perDay[dateKey]) {
                 perDay[dateKey] = {
                   in: 0,
                   cache: 0,
                   out: 0,
+                  costUsd: 0,
+                  savedUsd: 0,
+                  equivTokens: 0,
                   steps: 0,
                   models: {},
+                  modelCosts: {},
                 };
               }
               const d = perDay[dateKey];
               d.in += inp;
               d.cache += cac;
               d.out += out;
+              d.costUsd += quota.costUsd;
+              d.savedUsd += quota.savedUsd;
+              d.equivTokens += quota.equivTokens;
               d.steps += 1;
               d.models[modelName] = (d.models[modelName] || 0) + inp + cac + out;
+              d.modelCosts[modelName] = (d.modelCosts[modelName] || 0) + quota.costUsd;
             }
           } catch {
             // ignore line
@@ -400,9 +508,8 @@ function computeDailyUsage() {
     }
   }
 
-  // Merge all sessions by dateKey
   const dailyMap = new Map();
-  for (const [sessionId, sData] of Object.entries(persistentStore.sessions)) {
+  for (const [, sData] of Object.entries(persistentStore.sessions)) {
     const perDay = sData?.perDay || {};
     for (const [dateKey, metrics] of Object.entries(perDay)) {
       let agg = dailyMap.get(dateKey);
@@ -412,11 +519,15 @@ function computeDailyUsage() {
           inputTokens: 0,
           cacheTokens: 0,
           outputTokens: 0,
-          netTokens: 0, // input + output (excluding cache)
-          totalTokens: 0, // input + cache + output
+          netTokens: 0,
+          totalTokens: 0,
+          equivTokens: 0,
+          costUsd: 0,
+          savedUsd: 0,
           steps: 0,
           sessions: 0,
           models: {},
+          modelCosts: {},
         };
         dailyMap.set(dateKey, agg);
       }
@@ -428,10 +539,16 @@ function computeDailyUsage() {
       agg.outputTokens += out;
       agg.netTokens += inp + out;
       agg.totalTokens += inp + cac + out;
+      agg.equivTokens += Number(metrics.equivTokens || 0);
+      agg.costUsd = Number((agg.costUsd + Number(metrics.costUsd || 0)).toFixed(4));
+      agg.savedUsd = Number((agg.savedUsd + Number(metrics.savedUsd || 0)).toFixed(4));
       agg.steps += Number(metrics.steps || 0);
       agg.sessions += 1;
       for (const [mName, mTok] of Object.entries(metrics.models || {})) {
         agg.models[mName] = (agg.models[mName] || 0) + mTok;
+      }
+      for (const [mName, mCost] of Object.entries(metrics.modelCosts || {})) {
+        agg.modelCosts[mName] = Number(((agg.modelCosts[mName] || 0) + mCost).toFixed(4));
       }
     }
   }
@@ -445,17 +562,23 @@ function computeDailyUsage() {
     outputTokens: 0,
     netTokens: 0,
     totalTokens: 0,
+    equivTokens: 0,
+    costUsd: 0,
+    savedUsd: 0,
     steps: 0,
     sessions: 0,
     models: {},
+    modelCosts: {},
   };
 
   let totalAllTime = 0;
   let netAllTime = 0;
+  let costAllTimeUsd = 0;
   let maxDailyTotal = 0;
   for (const d of days) {
     totalAllTime += d.totalTokens;
     netAllTime += d.netTokens;
+    costAllTimeUsd += d.costUsd;
     if (d.totalTokens > maxDailyTotal) maxDailyTotal = d.totalTokens;
   }
 
@@ -465,6 +588,7 @@ function computeDailyUsage() {
     maxDailyTotal,
     totalAllTime,
     netAllTime,
+    costAllTimeUsd: Number(costAllTimeUsd.toFixed(2)),
     activeDaysCount: days.length,
     days,
   };
@@ -507,7 +631,6 @@ function parseSessionStats(sessionId) {
     }
   }
 
-  // Record finish timestamp for the latest step in the file
   if (rawSteps.length > 0) {
     const lastStep = rawSteps[rawSteps.length - 1];
     const key = `${targetId}:${lastStep.step_index}`;
@@ -525,6 +648,9 @@ function parseSessionStats(sessionId) {
   let totalOutputTokens = 0;
   let totalThinkingTokens = 0;
   let totalTextTokens = 0;
+  let totalCostUsd = 0;
+  let totalSavedUsd = 0;
+  let totalEquivTokens = 0;
 
   let totalMeasuredOutputTokens = 0;
   let totalE2EDurationSec = 0;
@@ -558,11 +684,16 @@ function parseSessionStats(sessionId) {
       const textTokens = dbStep?.textTokens ?? Math.max(0, outputTokens - thinkingTokens);
       const contextTokens = inputTokens + cacheTokens + outputTokens;
 
+      const quota = calcStepQuota(currentModel, inputTokens, cacheTokens, outputTokens);
+
       totalInputTokens += inputTokens;
       totalCacheTokens += cacheTokens;
       totalOutputTokens += outputTokens;
       totalThinkingTokens += thinkingTokens;
       totalTextTokens += textTokens;
+      totalCostUsd += quota.costUsd;
+      totalSavedUsd += quota.savedUsd;
+      totalEquivTokens += quota.equivTokens;
 
       const tStartMs = s.created_at ? Date.parse(s.created_at) : NaN;
       const nextStep = i + 1 < rawSteps.length ? rawSteps[i + 1] : null;
@@ -570,7 +701,6 @@ function parseSessionStats(sessionId) {
       let durationSec = null;
       let durationSource = 'unknown';
 
-      // Prefer exact SQLite step duration (f11 + f12) if available
       if (dbStep && dbStep.totalSec > 0.05 && dbStep.totalSec < 600) {
         durationSec = dbStep.totalSec;
         durationSource = 'sqlite_exact';
@@ -598,7 +728,6 @@ function parseSessionStats(sessionId) {
         }
       }
 
-      // Separate TTFT (Prefill + Network + Queue) vs Pure Token Decoding Duration
       let ttftSec = null;
       let decodeSec = null;
       let decodeTokPerSec = null;
@@ -607,19 +736,15 @@ function parseSessionStats(sessionId) {
       if (durationSec && durationSec > 0 && outputTokens > 0) {
         e2eTokPerSec = Number((outputTokens / durationSec).toFixed(1));
 
-        // Estimate network + prompt prefill / cache load TTFT before token generation starts:
-        // ~2.0s base network/dispatch overhead + uncached input prefill + cached KV load
         const estPrefillTtft = Math.min(
           durationSec * 0.58,
           2.0 + inputTokens / 8500 + cacheTokens / 140000
         );
 
         if (dbStep && dbStep.f12Sec >= 1.2 && textTokens >= 60) {
-          // Multi-chunk streaming step: we know both exact f12 (pure text streaming) and net decode time
           const netDecodeSec = Math.max(0.3, durationSec - estPrefillTtft);
           const streamRate = textTokens / dbStep.f12Sec;
           const netRate = outputTokens / netDecodeSec;
-          // Use pure streaming rate if reasonable, or net rate (deducting prefill TTFT)
           if (streamRate >= netRate && streamRate <= 220) {
             decodeTokPerSec = Number(streamRate.toFixed(1));
             ttftSec = Number(estPrefillTtft.toFixed(1));
@@ -630,7 +755,6 @@ function parseSessionStats(sessionId) {
             decodeTokPerSec = Number(netRate.toFixed(1));
           }
         } else {
-          // Single-chunk / tool-call step: deduct prefill TTFT from total duration
           ttftSec = Number(estPrefillTtft.toFixed(1));
           decodeSec = Number(Math.max(0.25, durationSec - estPrefillTtft).toFixed(1));
           decodeTokPerSec = Number((outputTokens / decodeSec).toFixed(1));
@@ -669,6 +793,7 @@ function parseSessionStats(sessionId) {
         textTokens,
         contextTokens,
         cacheHitRate: stepCacheHitRate,
+        quota,
         durationSec: durationSec ? Number(durationSec.toFixed(1)) : null,
         ttftSec,
         decodeSec,
@@ -677,7 +802,7 @@ function parseSessionStats(sessionId) {
         durationSource,
         decodeTokPerSec,
         e2eTokPerSec,
-        tokPerSec: decodeTokPerSec, // primary metric defaults to pure decode speed
+        tokPerSec: decodeTokPerSec,
         tools,
         hasThinking: Boolean(s.thinking || thinkingTokens > 0),
       });
@@ -727,6 +852,9 @@ function parseSessionStats(sessionId) {
       totalOutputTokens,
       totalThinkingTokens,
       totalTextTokens,
+      totalCostUsd: Number(totalCostUsd.toFixed(4)),
+      totalSavedUsd: Number(totalSavedUsd.toFixed(4)),
+      totalEquivTokens,
       currentContextTokens,
       overallCacheHitRate,
       latestDecodeTokPerSec: latestMeasured ? latestMeasured.decodeTokPerSec : null,
@@ -736,7 +864,6 @@ function parseSessionStats(sessionId) {
       avgE2ETokPerSec,
       peakDecodeTokPerSec: peakDecodeTokPerSec > 0 ? peakDecodeTokPerSec : null,
       peakE2ETokPerSec: peakE2ETokPerSec > 0 ? peakE2ETokPerSec : null,
-      // backwards-compatible fields
       latestTokPerSec: latestMeasured ? latestMeasured.decodeTokPerSec : null,
       avgTokPerSec: avgDecodeTokPerSec,
       peakTokPerSec: peakDecodeTokPerSec > 0 ? peakDecodeTokPerSec : null,
