@@ -24,7 +24,7 @@ try {
   // Fallback if node:sqlite is unavailable
 }
 
-const DAILY_STORE_SCHEMA_VERSION = 2;
+const DAILY_STORE_SCHEMA_VERSION = 3;
 
 // Record exact completion mtime when a step is first observed at the tail of transcript.jsonl
 const stepFinishObservedMs = new Map();
@@ -67,6 +67,37 @@ function formatModelDisplayName(raw) {
   return raw.replace(/\bArgon\b/gi, 'Pro');
 }
 
+function formatRawModelId(rawId) {
+  const s = String(rawId || '').trim();
+  if (!s) return 'Default';
+  if (/orchestrator/i.test(s)) return 'Orchestrator';
+  if (/flash[-_]*lite/i.test(s)) return 'Gemini Flash Lite';
+  if (/gemini-3\.8-flash/i.test(s)) return 'Gemini 3.8 Flash';
+  if (/gemini-3\.7-flash/i.test(s)) return 'Gemini 3.7 Flash';
+  if (/flash/i.test(s)) return 'Gemini Flash';
+  if (/carbon/i.test(s)) return 'Gemini 4 Carbon';
+  if (/argon/i.test(s)) return 'Gemini 4 Pro';
+  if (/opus/i.test(s)) return 'Claude Opus';
+  if (/sonnet/i.test(s)) return 'Claude Sonnet';
+  if (/haiku/i.test(s)) return 'Claude Haiku';
+  return formatModelDisplayName(s);
+}
+
+function shortEngineName(name) {
+  const s = String(name || '').trim();
+  if (!s) return 'Executor';
+  if (/3\.8[\s-]*flash/i.test(s)) return '3.8 Flash';
+  if (/3\.7[\s-]*flash/i.test(s)) return '3.7 Flash';
+  if (/flash[\s-]*lite/i.test(s)) return 'Flash Lite';
+  if (/flash/i.test(s)) return 'Flash';
+  if (/carbon/i.test(s)) return 'Carbon';
+  if (/argon|gemini.*pro/i.test(s)) return 'Pro';
+  if (/opus/i.test(s)) return 'Opus';
+  if (/sonnet/i.test(s)) return 'Sonnet';
+  if (/haiku/i.test(s)) return 'Haiku';
+  return s.replace(/^Gemini\s+\d+(?:\.\d+)?\s+/i, '').replace(/\s*\([^)]+\)\s*$/, '').trim() || s;
+}
+
 function extractModelName(rawContent) {
   if (!rawContent || typeof rawContent !== 'string') return '';
   const match = rawContent.match(
@@ -74,6 +105,116 @@ function extractModelName(rawContent) {
   );
   if (!match) return '';
   return formatModelDisplayName(match[1].trim());
+}
+
+function createOrchTracker() {
+  let active = false;
+  let phase = 'plan';
+  let plannerBase = 'Carbon';
+
+  function extractBaseFromLabel(label) {
+    const m = String(label || '').match(/\(([^)]+)\)/);
+    if (!m) return '';
+    return formatModelDisplayName(m[1]).replace(/^Gemini\s+\d+(?:\.\d+)?\s+/i, '').trim();
+  }
+
+  return {
+    onMessage(step) {
+      if (!step) return;
+      const content = typeof step.content === 'string' ? step.content : '';
+      const isPlanOffMsg = content.includes('Plan mode is off');
+      const isPlanReviewMsg =
+        !isPlanOffMsg && /(?:^|\n)\s*\[plan review(?:\s+due)?\]/m.test(content);
+
+      if (step.type === 'USER_INPUT') {
+        const m = extractModelName(content);
+        if (m) {
+          if (/orchestrator/i.test(m)) {
+            active = true;
+            const base = extractBaseFromLabel(m);
+            if (base) plannerBase = base;
+          } else {
+            active = false;
+          }
+        }
+        phase = isPlanReviewMsg ? 'review' : 'plan';
+      } else if (step.type === 'SYSTEM_MESSAGE') {
+        if (isPlanOffMsg) {
+          if (active) phase = 'exec';
+        } else if (isPlanReviewMsg) {
+          active = true;
+          phase = 'review';
+        }
+      }
+    },
+
+    onPlannerStep(step, dbStep, fallbackModel) {
+      const tools = Array.isArray(step?.tool_calls)
+        ? step.tool_calls.map((tc) => tc.name).filter(Boolean)
+        : [];
+      const uiLabel = dbStep?.rawUiLabel || '';
+      const modelId = dbStep?.rawModelId || '';
+
+      if (/orchestrator/i.test(uiLabel) || /orchestrator/i.test(modelId)) {
+        active = true;
+        const base = extractBaseFromLabel(uiLabel);
+        if (base) plannerBase = base;
+      } else if (uiLabel && !/orchestrator/i.test(uiLabel) && phase !== 'exec') {
+        active = false;
+      }
+
+      if (tools.includes('exit_plan_mode') || tools.includes('enter_plan_mode')) {
+        active = true;
+      }
+
+      if (!active) {
+        const resolved = dbStep?.model || fallbackModel;
+        return {
+          orch: null,
+          displayModel: resolved,
+          pricingModel: resolved,
+        };
+      }
+
+      const currentPhase = phase;
+      const handoff = tools.includes('exit_plan_mode')
+        ? 'to_exec'
+        : tools.includes('enter_plan_mode')
+          ? 'to_plan'
+          : null;
+
+      let engine = plannerBase || 'Carbon';
+      let pricingModel = engine;
+
+      if (currentPhase === 'exec') {
+        const concreteExec =
+          uiLabel && !/orchestrator/i.test(uiLabel)
+            ? formatModelDisplayName(uiLabel)
+            : modelId && !/orchestrator/i.test(modelId)
+              ? formatRawModelId(modelId)
+              : '';
+        engine = concreteExec ? shortEngineName(concreteExec) : 'Flash Exec';
+        pricingModel = concreteExec || 'Gemini Flash';
+      }
+
+      if (handoff === 'to_exec') {
+        phase = 'exec';
+      } else if (handoff === 'to_plan') {
+        phase = 'review';
+      }
+
+      return {
+        orch: {
+          phase: currentPhase,
+          engine,
+          plannerBase,
+          handoff,
+        },
+        displayModel: `Orchestrator (${plannerBase})`,
+        pricingModel,
+      };
+    },
+  };
 }
 
 function toLocalDateStr(isoOrMs) {
@@ -277,8 +418,14 @@ function getSessionDbTelemetry(sessionId, hintMtimeMs = 0) {
         const u = m[4]?.[0] ? parseProto(m[4][0]) : {};
         const f11Sec = m[11]?.[0] ? parseProtoDurationSec(m[11][0]) : 0;
         const f12Sec = m[12]?.[0] ? parseProtoDurationSec(m[12][0]) : 0;
-        const rawModel = m[21]?.[0] ? m[21][0].toString('utf8').trim() : '';
-        const model = rawModel ? formatModelDisplayName(rawModel) : '';
+        const rawModelId = m[19]?.[0] ? m[19][0].toString('utf8').trim() : '';
+        const rawUiLabel = m[21]?.[0] ? m[21][0].toString('utf8').trim() : '';
+        const backendModelEnum = u[1]?.[0] || m[3]?.[0] || 0;
+        const model = rawUiLabel
+          ? formatModelDisplayName(rawUiLabel)
+          : rawModelId
+            ? formatRawModelId(rawModelId)
+            : '';
 
         let lastStepIdx = null;
         for (const kvBuf of m[20] || []) {
@@ -292,6 +439,9 @@ function getSessionDbTelemetry(sessionId, hintMtimeMs = 0) {
           genIdx: r.idx,
           lastStepIdx,
           model,
+          rawModelId,
+          rawUiLabel,
+          backendModelEnum,
           inputTokens: u[2]?.[0] || 0,
           outputTokens: u[3]?.[0] || 0,
           cacheTokens: u[5]?.[0] || 0,
@@ -441,26 +591,32 @@ function computeDailyUsage() {
 
         const lines = fs.readFileSync(transcriptPath, 'utf8').split('\n').filter(Boolean);
         const dbMap = getSessionDbTelemetry(id, stat.mtimeMs);
+        const orchTracker = createOrchTracker();
         let currentModel = 'Gemini 4 Pro';
         const perDay = {};
 
         for (const line of lines) {
           try {
             const s = JSON.parse(line);
-            if (s.type === 'USER_INPUT' && s.content) {
-              const m = extractModelName(s.content);
-              if (m) currentModel = m;
+            if (s.type === 'USER_INPUT' || s.type === 'SYSTEM_MESSAGE') {
+              orchTracker.onMessage(s);
+              if (s.type === 'USER_INPUT' && s.content) {
+                const m = extractModelName(s.content);
+                if (m) currentModel = m;
+              }
             } else if (s.type === 'PLANNER_RESPONSE' && s.created_at) {
               const dateKey = toLocalDateStr(s.created_at);
               if (!dateKey) continue;
               const dbInfo = dbMap.get(s.step_index);
-              const modelName = dbInfo?.model || currentModel || 'Default';
               if (dbInfo?.model) currentModel = dbInfo.model;
+
+              const { displayModel, pricingModel } = orchTracker.onPlannerStep(s, dbInfo, currentModel || 'Default');
+              const modelName = displayModel || 'Default';
 
               const inp = Number(s.input_tokens || 0);
               const cac = Number(s.cache_read_tokens || 0);
               const out = Number(s.output_tokens || 0);
-              const quota = calcStepQuota(modelName, inp, cac, out);
+              const quota = calcStepQuota(pricingModel || modelName, inp, cac, out);
 
               if (!perDay[dateKey]) {
                 perDay[dateKey] = {
@@ -639,6 +795,7 @@ function parseSessionStats(sessionId) {
     }
   }
 
+  const orchTracker = createOrchTracker();
   let currentModel = 'Gemini 4 Pro';
   let sessionTitle = `会话 ${targetId.slice(0, 8)}`;
   const plannerSteps = [];
@@ -660,21 +817,38 @@ function parseSessionStats(sessionId) {
   let peakDecodeTokPerSec = 0;
   let peakE2ETokPerSec = 0;
 
+  let planSteps = 0;
+  let execSteps = 0;
+  let reviewSteps = 0;
+
   for (let i = 0; i < rawSteps.length; i++) {
     const s = rawSteps[i];
-    if (s.type === 'USER_INPUT' && s.content) {
-      if (sessionTitle.startsWith('会话 ')) {
-        const t = extractUserTitle(s.content);
-        if (t) sessionTitle = t;
+    if (s.type === 'USER_INPUT' || s.type === 'SYSTEM_MESSAGE') {
+      orchTracker.onMessage(s);
+      if (s.type === 'USER_INPUT' && s.content) {
+        if (sessionTitle.startsWith('会话 ')) {
+          const t = extractUserTitle(s.content);
+          if (t) sessionTitle = t;
+        }
+        const m = extractModelName(s.content);
+        if (m) currentModel = m;
       }
-      const m = extractModelName(s.content);
-      if (m) currentModel = m;
     }
 
     if (s.type === 'PLANNER_RESPONSE') {
       const dbStep = dbMap.get(s.step_index);
       if (dbStep?.model) {
         currentModel = dbStep.model;
+      }
+
+      const { orch, displayModel, pricingModel } = orchTracker.onPlannerStep(s, dbStep, currentModel);
+      if (displayModel) {
+        currentModel = displayModel;
+      }
+      if (orch) {
+        if (orch.phase === 'plan') planSteps += 1;
+        else if (orch.phase === 'exec') execSteps += 1;
+        else if (orch.phase === 'review') reviewSteps += 1;
       }
 
       const inputTokens = Number(s.input_tokens || dbStep?.inputTokens || 0);
@@ -684,7 +858,7 @@ function parseSessionStats(sessionId) {
       const textTokens = dbStep?.textTokens ?? Math.max(0, outputTokens - thinkingTokens);
       const contextTokens = inputTokens + cacheTokens + outputTokens;
 
-      const quota = calcStepQuota(currentModel, inputTokens, cacheTokens, outputTokens);
+      const quota = calcStepQuota(pricingModel || currentModel, inputTokens, cacheTokens, outputTokens);
 
       totalInputTokens += inputTokens;
       totalCacheTokens += cacheTokens;
@@ -785,7 +959,8 @@ function parseSessionStats(sessionId) {
       plannerSteps.push({
         stepIndex: s.step_index,
         createdAt: s.created_at,
-        model: currentModel,
+        model: displayModel || currentModel,
+        orch,
         inputTokens,
         cacheTokens,
         outputTokens,
@@ -847,6 +1022,7 @@ function parseSessionStats(sessionId) {
     dailyUsage,
     summary: {
       stepCount: plannerSteps.length,
+      orchSummary: { planSteps, execSteps, reviewSteps },
       totalInputTokens,
       totalCacheTokens,
       totalOutputTokens,
