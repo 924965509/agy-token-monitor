@@ -19,7 +19,7 @@
 
 3. **📊 实时上下文水位、Orchestrator 双阶段追踪与缓存命中率趋势图**
    - 双轴 SVG 趋势图：同屏展示最近 28 步的生成速度柱状图与上下文窗口水位折线；对 `Orchestrator` 模式按 **规划 (`plan` 靛蓝)** / **执行 (`exec` 青绿)** / **复盘 (`review` 紫金)** 自动分段着色。
-   - 彩色模型胶囊标签：自动识别 `Orchestrator`（紫金渐变徽章 + 阶段/引擎/交棒状态子徽章）、`Gemini 4 Pro`、`Gemini 4 Carbon`、`Gemini Flash`、`Claude` 等不同模型。
+   - 彩色模型胶囊标签：自动识别 `Orchestrator`（紫金渐变徽章 + 阶段/引擎/交棒状态子徽章，兼容 `Hydrogen` / `Flash` 执行引擎）、`Gemini 4 Neon`、`Gemini 4 Hydrogen`、`Gemini 4 Carbon`、`Gemini 4 Pro`、`Gemini Flash`、`Claude` 等全部新旧模型。
 
 ---
 

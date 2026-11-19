@@ -24,7 +24,7 @@ try {
   // Fallback if node:sqlite is unavailable
 }
 
-const DAILY_STORE_SCHEMA_VERSION = 3;
+const DAILY_STORE_SCHEMA_VERSION = 4;
 
 // Record exact completion mtime when a step is first observed at the tail of transcript.jsonl
 const stepFinishObservedMs = new Map();
@@ -34,6 +34,12 @@ const dbTelemetryCache = new Map();
 
 // Cache for per-session daily usage keyed by sessionId -> { mtimeMs, perDay }
 const sessionDailyCache = new Map();
+
+// Cache for session title extracted from first 8KB of transcript.jsonl: id -> { size, title }
+const sessionTitleCache = new Map();
+
+// Short-lived cache for aggregated daily usage to avoid scanning 100+ sessions every 2s
+let dailyUsageCache = { ts: 0, latestMtimeMs: 0, result: null };
 
 function getAppDataDir() {
   if (process.env.ANTIGRAVITY_APP_DATA_DIR) {
@@ -70,11 +76,18 @@ function formatModelDisplayName(raw) {
 function formatRawModelId(rawId) {
   const s = String(rawId || '').trim();
   if (!s) return 'Default';
-  if (/orchestrator/i.test(s)) return 'Orchestrator';
+  if (/orchestrator[-_]*argon/i.test(s)) return 'Orchestrator (Pro)';
+  if (/orchestrator[-_]*neon/i.test(s)) return 'Orchestrator (Neon)';
+  if (/orchestrator[-_]*hydrogen/i.test(s)) return 'Orchestrator (Hydrogen)';
+  if (/orchestrator/i.test(s)) return 'Orchestrator (Carbon)';
   if (/flash[-_]*lite/i.test(s)) return 'Gemini Flash Lite';
   if (/gemini-3\.8-flash/i.test(s)) return 'Gemini 3.8 Flash';
   if (/gemini-3\.7-flash/i.test(s)) return 'Gemini 3.7 Flash';
   if (/flash/i.test(s)) return 'Gemini Flash';
+  if (/neon/i.test(s)) return 'Gemini 4 Neon';
+  if (/hydrogen[-_]*tiered[-_]*xhigh/i.test(s)) return 'Gemini 4 Hydrogen (XHigh)';
+  if (/hydrogen[-_]*tiered[-_]*high/i.test(s)) return 'Gemini 4 Hydrogen (High)';
+  if (/hydrogen/i.test(s)) return 'Gemini 4 Hydrogen';
   if (/carbon/i.test(s)) return 'Gemini 4 Carbon';
   if (/argon/i.test(s)) return 'Gemini 4 Pro';
   if (/opus/i.test(s)) return 'Claude Opus';
@@ -90,6 +103,8 @@ function shortEngineName(name) {
   if (/3\.7[\s-]*flash/i.test(s)) return '3.7 Flash';
   if (/flash[\s-]*lite/i.test(s)) return 'Flash Lite';
   if (/flash/i.test(s)) return 'Flash';
+  if (/neon/i.test(s)) return 'Neon';
+  if (/hydrogen/i.test(s)) return 'Hydrogen';
   if (/carbon/i.test(s)) return 'Carbon';
   if (/argon|gemini.*pro/i.test(s)) return 'Pro';
   if (/opus/i.test(s)) return 'Opus';
@@ -112,10 +127,56 @@ function createOrchTracker() {
   let phase = 'plan';
   let plannerBase = 'Carbon';
 
-  function extractBaseFromLabel(label) {
-    const m = String(label || '').match(/\(([^)]+)\)/);
-    if (!m) return '';
-    return formatModelDisplayName(m[1]).replace(/^Gemini\s+\d+(?:\.\d+)?\s+/i, '').trim();
+  function isOrchPlannerLabel(label) {
+    return /^\s*orchestrator\b/i.test(String(label || ''));
+  }
+
+  function isOrchPlannerId(modelId) {
+    return /orchestrator/i.test(String(modelId || ''));
+  }
+
+  function isOrchWorkerLabel(label) {
+    return /\(\s*orchestrator\s*\)\s*$/i.test(String(label || ''));
+  }
+
+  function isOrchWorkerId(modelId) {
+    return /[-_]worker[-_]/i.test(String(modelId || ''));
+  }
+
+  function extractPlannerBase(label, modelId = '') {
+    if (isOrchPlannerLabel(label)) {
+      const m = String(label || '').match(/\(([^)]+)\)/);
+      if (m) {
+        const cleaned = formatModelDisplayName(m[1])
+          .replace(/^Gemini\s+\d+(?:\.\d+)?\s+/i, '')
+          .trim();
+        if (cleaned && !/^orchestrator$/i.test(cleaned)) return cleaned;
+      }
+    }
+    const id = String(modelId || '');
+    if (isOrchPlannerId(id)) {
+      if (/argon/i.test(id)) return 'Pro';
+      if (/neon/i.test(id)) return 'Neon';
+      if (/hydrogen/i.test(id)) return 'Hydrogen';
+      if (/carbon/i.test(id)) return 'Carbon';
+    }
+    return '';
+  }
+
+  function extractWorkerModel(uiLabel, modelId) {
+    if (isOrchWorkerLabel(uiLabel)) {
+      const stripped = String(uiLabel)
+        .replace(/\s*\(\s*orchestrator\s*\)\s*$/i, '')
+        .trim();
+      return formatModelDisplayName(stripped);
+    }
+    if (uiLabel && !isOrchPlannerLabel(uiLabel)) {
+      return formatModelDisplayName(uiLabel);
+    }
+    if (modelId && !isOrchPlannerId(modelId)) {
+      return formatRawModelId(modelId);
+    }
+    return '';
   }
 
   return {
@@ -129,9 +190,9 @@ function createOrchTracker() {
       if (step.type === 'USER_INPUT') {
         const m = extractModelName(content);
         if (m) {
-          if (/orchestrator/i.test(m)) {
+          if (isOrchPlannerLabel(m)) {
             active = true;
-            const base = extractBaseFromLabel(m);
+            const base = extractPlannerBase(m);
             if (base) plannerBase = base;
           } else {
             active = false;
@@ -155,11 +216,18 @@ function createOrchTracker() {
       const uiLabel = dbStep?.rawUiLabel || '';
       const modelId = dbStep?.rawModelId || '';
 
-      if (/orchestrator/i.test(uiLabel) || /orchestrator/i.test(modelId)) {
+      const plannerStep = isOrchPlannerLabel(uiLabel) || isOrchPlannerId(modelId);
+      const workerStep = !plannerStep && (isOrchWorkerLabel(uiLabel) || isOrchWorkerId(modelId));
+
+      if (plannerStep) {
         active = true;
-        const base = extractBaseFromLabel(uiLabel);
+        const base = extractPlannerBase(uiLabel, modelId);
         if (base) plannerBase = base;
-      } else if (uiLabel && !/orchestrator/i.test(uiLabel) && phase !== 'exec') {
+        if (phase === 'exec') phase = 'review';
+      } else if (workerStep) {
+        active = true;
+        phase = 'exec';
+      } else if (uiLabel && phase !== 'exec') {
         active = false;
       }
 
@@ -187,13 +255,8 @@ function createOrchTracker() {
       let pricingModel = engine;
 
       if (currentPhase === 'exec') {
-        const concreteExec =
-          uiLabel && !/orchestrator/i.test(uiLabel)
-            ? formatModelDisplayName(uiLabel)
-            : modelId && !/orchestrator/i.test(modelId)
-              ? formatRawModelId(modelId)
-              : '';
-        engine = concreteExec ? shortEngineName(concreteExec) : 'Flash Exec';
+        const concreteExec = extractWorkerModel(uiLabel, modelId);
+        engine = concreteExec ? shortEngineName(concreteExec) : 'Exec';
         pricingModel = concreteExec || 'Gemini Flash';
       }
 
@@ -272,17 +335,24 @@ function getModelPricing(modelName, promptContextTokens = 0) {
       outputPricePerM: 2.5,
     };
   }
-  // Gemini Pro / Carbon / Default (>200k tiered context pricing)
+  // Gemini 4 Neon / Hydrogen / Carbon / Pro (>200k tiered context pricing)
+  const familyLabel = m.includes('neon')
+    ? 'Gemini 4 Neon'
+    : m.includes('hydrogen')
+      ? 'Gemini 4 Hydrogen'
+      : m.includes('carbon')
+        ? 'Gemini 4 Carbon'
+        : 'Gemini Pro';
   if (promptContextTokens > 200000) {
     return {
-      tier: 'Gemini Pro (>200k)',
+      tier: `${familyLabel} (>200k)`,
       inputPricePerM: 4.0,
       cacheReadPricePerM: 0.4,
       outputPricePerM: 18.0,
     };
   }
   return {
-    tier: 'Gemini Pro (≤200k)',
+    tier: `${familyLabel} (≤200k)`,
     inputPricePerM: 2.0,
     cacheReadPricePerM: 0.2,
     outputPricePerM: 12.0,
@@ -507,27 +577,33 @@ function listSessions() {
 
     try {
       const stat = fs.statSync(transcriptPath);
-      const fd = fs.openSync(transcriptPath, 'r');
-      const buf = Buffer.alloc(Math.min(8192, stat.size));
-      fs.readSync(fd, buf, 0, buf.length, 0);
-      fs.closeSync(fd);
-
-      const firstChunk = buf.toString('utf8');
-      const firstLines = firstChunk.split('\n').filter(Boolean);
+      const cachedTitle = sessionTitleCache.get(id);
       let title = `会话 ${id.slice(0, 8)}`;
-      for (const line of firstLines.slice(0, 5)) {
-        try {
-          const obj = JSON.parse(line);
-          if (obj.type === 'USER_INPUT' && obj.content) {
-            const extracted = extractUserTitle(obj.content);
-            if (extracted) {
-              title = extracted;
-              break;
+      if (cachedTitle && (!cachedTitle.title.startsWith('会话 ') || cachedTitle.size === stat.size)) {
+        title = cachedTitle.title;
+      } else {
+        const fd = fs.openSync(transcriptPath, 'r');
+        const buf = Buffer.alloc(Math.min(8192, stat.size));
+        fs.readSync(fd, buf, 0, buf.length, 0);
+        fs.closeSync(fd);
+
+        const firstChunk = buf.toString('utf8');
+        const firstLines = firstChunk.split('\n').filter(Boolean);
+        for (const line of firstLines.slice(0, 5)) {
+          try {
+            const obj = JSON.parse(line);
+            if (obj.type === 'USER_INPUT' && obj.content) {
+              const extracted = extractUserTitle(obj.content);
+              if (extracted) {
+                title = extracted;
+                break;
+              }
             }
+          } catch {
+            // ignore partial line
           }
-        } catch {
-          // ignore partial line
         }
+        sessionTitleCache.set(id, { size: stat.size, title });
       }
 
       sessions.push({
@@ -550,7 +626,16 @@ function listSessions() {
 /**
  * Aggregates daily token & quota usage across all sessions in brainDir
  */
-function computeDailyUsage() {
+function computeDailyUsage(latestMtimeMs = 0) {
+  const now = Date.now();
+  if (
+    dailyUsageCache.result &&
+    dailyUsageCache.latestMtimeMs === latestMtimeMs &&
+    now - dailyUsageCache.ts < 8000
+  ) {
+    return dailyUsageCache.result;
+  }
+
   const brainDir = getBrainDir();
   const storePath = getDailyHistoryStorePath();
 
@@ -738,7 +823,7 @@ function computeDailyUsage() {
     if (d.totalTokens > maxDailyTotal) maxDailyTotal = d.totalTokens;
   }
 
-  return {
+  const result = {
     todayDate: todayStr,
     today: todayEntry,
     maxDailyTotal,
@@ -748,19 +833,29 @@ function computeDailyUsage() {
     activeDaysCount: days.length,
     days,
   };
+  dailyUsageCache = { ts: Date.now(), latestMtimeMs, result };
+  return result;
 }
 
 function parseSessionStats(sessionId) {
   const sessions = listSessions();
-  const targetId =
-    sessionId && sessions.some((s) => s.id === sessionId)
-      ? sessionId
-      : process.env.ANTIGRAVITY_CONVERSATION_ID &&
-          sessions.some((s) => s.id === process.env.ANTIGRAVITY_CONVERSATION_ID)
-        ? process.env.ANTIGRAVITY_CONVERSATION_ID
-        : sessions[0]?.id || null;
+  const brainDir = getBrainDir();
+  const cleanSessionId =
+    sessionId && sessionId !== '__latest__' ? String(sessionId).trim() : '';
 
-  const dailyUsage = computeDailyUsage();
+  let targetId = null;
+  if (cleanSessionId) {
+    const directTp = path.join(brainDir, cleanSessionId, '.system_generated', 'logs', 'transcript.jsonl');
+    if (sessions.some((s) => s.id === cleanSessionId) || fs.existsSync(directTp)) {
+      targetId = cleanSessionId;
+    }
+  }
+  if (!targetId) {
+    targetId = sessions[0]?.id || null;
+  }
+
+  const latestMtimeMs = sessions[0]?.mtimeMs || 0;
+  const dailyUsage = computeDailyUsage(latestMtimeMs);
 
   if (!targetId) {
     return {
@@ -772,7 +867,6 @@ function parseSessionStats(sessionId) {
     };
   }
 
-  const brainDir = getBrainDir();
   const transcriptPath = path.join(brainDir, targetId, '.system_generated', 'logs', 'transcript.jsonl');
   const stat = fs.statSync(transcriptPath);
   const rawLines = fs.readFileSync(transcriptPath, 'utf8').split('\n').filter(Boolean);
