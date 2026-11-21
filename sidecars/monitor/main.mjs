@@ -24,7 +24,7 @@ try {
   // Fallback if node:sqlite is unavailable
 }
 
-const DAILY_STORE_SCHEMA_VERSION = 4;
+const DAILY_STORE_SCHEMA_VERSION = 5;
 
 // Record exact completion mtime when a step is first observed at the tail of transcript.jsonl
 const stepFinishObservedMs = new Map();
@@ -96,21 +96,48 @@ function formatRawModelId(rawId) {
   return formatModelDisplayName(s);
 }
 
-function shortEngineName(name) {
+function extractTrailingParen(name) {
+  const m = String(name || '').match(/\(([^)]+)\)\s*$/);
+  return m ? m[1].trim() : '';
+}
+
+function isEffortTag(tag) {
+  return /^(?:low|medium|high|xhigh|extra[-_\s]*low|max|thinking)$/i.test(String(tag || '').trim());
+}
+
+function shortEngineName(name, includeEffort = false) {
   const s = String(name || '').trim();
   if (!s) return 'Executor';
-  if (/3\.8[\s-]*flash/i.test(s)) return '3.8 Flash';
-  if (/3\.7[\s-]*flash/i.test(s)) return '3.7 Flash';
-  if (/flash[\s-]*lite/i.test(s)) return 'Flash Lite';
-  if (/flash/i.test(s)) return 'Flash';
-  if (/neon/i.test(s)) return 'Neon';
-  if (/hydrogen/i.test(s)) return 'Hydrogen';
-  if (/carbon/i.test(s)) return 'Carbon';
-  if (/argon|gemini.*pro/i.test(s)) return 'Pro';
-  if (/opus/i.test(s)) return 'Opus';
-  if (/sonnet/i.test(s)) return 'Sonnet';
-  if (/haiku/i.test(s)) return 'Haiku';
-  return s.replace(/^Gemini\s+\d+(?:\.\d+)?\s+/i, '').replace(/\s*\([^)]+\)\s*$/, '').trim() || s;
+
+  const paren = extractTrailingParen(s);
+  const effortSuffix =
+    includeEffort && paren && isEffortTag(paren) ? ` (${paren})` : '';
+
+  let base = '';
+  if (/3\.8[\s-]*flash/i.test(s)) base = '3.8 Flash';
+  else if (/3\.7[\s-]*flash/i.test(s)) base = '3.7 Flash';
+  else if (/flash[\s-]*lite/i.test(s)) base = 'Flash Lite';
+  else if (/flash/i.test(s)) base = 'Flash';
+  else if (/neon/i.test(s)) base = 'Neon';
+  else if (/hydrogen/i.test(s)) base = 'Hydrogen';
+  else if (/carbon/i.test(s)) base = 'Carbon';
+  else if (/argon|gemini.*pro/i.test(s)) base = 'Pro';
+  else {
+    const opusMatch = s.match(/opus(?:\s+(\d+(?:\.\d+)?))?/i);
+    const sonnetMatch = s.match(/sonnet(?:\s+(\d+(?:\.\d+)?))?/i);
+    const haikuMatch = s.match(/haiku(?:\s+(\d+(?:\.\d+)?))?/i);
+    if (opusMatch) base = opusMatch[1] ? `Opus ${opusMatch[1]}` : 'Opus';
+    else if (sonnetMatch) base = sonnetMatch[1] ? `Sonnet ${sonnetMatch[1]}` : 'Sonnet';
+    else if (haikuMatch) base = haikuMatch[1] ? `Haiku ${haikuMatch[1]}` : 'Haiku';
+    else {
+      base =
+        s
+          .replace(/^Gemini\s+\d+(?:\.\d+)?\s+/i, '')
+          .replace(/\s*\([^)]+\)\s*$/, '')
+          .trim() || s;
+    }
+  }
+  return `${base}${effortSuffix}`;
 }
 
 function extractModelName(rawContent) {
@@ -124,8 +151,12 @@ function extractModelName(rawContent) {
 
 function createOrchTracker() {
   let active = false;
+  let explicitOrch = false;
+  let awaitingReview = false;
   let phase = 'plan';
-  let plannerBase = 'Carbon';
+  let plannerBase = '';
+  let plannerFullModel = '';
+  let lastConcreteModel = '';
 
   function isOrchPlannerLabel(label) {
     return /^\s*orchestrator\b/i.test(String(label || ''));
@@ -143,24 +174,63 @@ function createOrchTracker() {
     return /[-_]worker[-_]/i.test(String(modelId || ''));
   }
 
-  function extractPlannerBase(label, modelId = '') {
-    if (isOrchPlannerLabel(label)) {
-      const m = String(label || '').match(/\(([^)]+)\)/);
+  function plannerBaseToFullModel(base) {
+    const b = String(base || '').trim();
+    if (!b) return 'Gemini 4 Carbon';
+    if (/^carbon$/i.test(b)) return 'Gemini 4 Carbon';
+    if (/^(?:pro|argon)$/i.test(b)) return 'Gemini 4 Pro';
+    if (/^neon$/i.test(b)) return 'Gemini 4 Neon';
+    if (/^hydrogen$/i.test(b)) return 'Gemini 4 Hydrogen';
+    if (/^opus/i.test(b)) return `Claude ${b}`;
+    if (/^sonnet/i.test(b)) return `Claude ${b}`;
+    if (/^haiku/i.test(b)) return `Claude ${b}`;
+    return b;
+  }
+
+  function extractPlannerInfo(label, modelId = '') {
+    const ui = String(label || '').trim();
+    const id = String(modelId || '').trim();
+
+    if (isOrchPlannerLabel(ui)) {
+      const m = ui.match(/\(([^)]+)\)/);
       if (m) {
         const cleaned = formatModelDisplayName(m[1])
           .replace(/^Gemini\s+\d+(?:\.\d+)?\s+/i, '')
           .trim();
-        if (cleaned && !/^orchestrator$/i.test(cleaned)) return cleaned;
+        if (cleaned && !/^orchestrator$/i.test(cleaned)) {
+          return {
+            base: cleaned,
+            fullModel: plannerBaseToFullModel(cleaned),
+          };
+        }
       }
     }
-    const id = String(modelId || '');
+
     if (isOrchPlannerId(id)) {
-      if (/argon/i.test(id)) return 'Pro';
-      if (/neon/i.test(id)) return 'Neon';
-      if (/hydrogen/i.test(id)) return 'Hydrogen';
-      if (/carbon/i.test(id)) return 'Carbon';
+      if (/argon/i.test(id)) return { base: 'Pro', fullModel: 'Gemini 4 Pro' };
+      if (/neon/i.test(id)) return { base: 'Neon', fullModel: 'Gemini 4 Neon' };
+      if (/hydrogen/i.test(id)) return { base: 'Hydrogen', fullModel: 'Gemini 4 Hydrogen' };
+      if (/carbon/i.test(id)) return { base: 'Carbon', fullModel: 'Gemini 4 Carbon' };
+      return { base: 'Carbon', fullModel: 'Gemini 4 Carbon' };
     }
-    return '';
+
+    if (ui && !isOrchWorkerLabel(ui)) {
+      const formatted = formatModelDisplayName(ui);
+      return {
+        base: shortEngineName(formatted, false),
+        fullModel: formatted,
+      };
+    }
+
+    if (id && !isOrchWorkerId(id)) {
+      const formatted = formatRawModelId(id);
+      return {
+        base: shortEngineName(formatted, false),
+        fullModel: formatted,
+      };
+    }
+
+    return null;
   }
 
   function extractWorkerModel(uiLabel, modelId) {
@@ -191,20 +261,38 @@ function createOrchTracker() {
         const m = extractModelName(content);
         if (m) {
           if (isOrchPlannerLabel(m)) {
+            explicitOrch = true;
             active = true;
-            const base = extractPlannerBase(m);
-            if (base) plannerBase = base;
+            awaitingReview = false;
+            const info = extractPlannerInfo(m);
+            if (info) {
+              plannerBase = info.base;
+              plannerFullModel = info.fullModel;
+            }
           } else {
+            explicitOrch = false;
             active = false;
+            awaitingReview = false;
+            lastConcreteModel = m;
           }
+        } else if (!explicitOrch && !isPlanReviewMsg) {
+          active = false;
+          awaitingReview = false;
         }
         phase = isPlanReviewMsg ? 'review' : 'plan';
+        if (isPlanReviewMsg) {
+          active = true;
+          awaitingReview = true;
+        }
       } else if (step.type === 'SYSTEM_MESSAGE') {
         if (isPlanOffMsg) {
-          if (active) phase = 'exec';
+          active = true;
+          phase = 'exec';
+          awaitingReview = false;
         } else if (isPlanReviewMsg) {
           active = true;
           phase = 'review';
+          awaitingReview = true;
         }
       }
     },
@@ -218,21 +306,61 @@ function createOrchTracker() {
 
       const plannerStep = isOrchPlannerLabel(uiLabel) || isOrchPlannerId(modelId);
       const workerStep = !plannerStep && (isOrchWorkerLabel(uiLabel) || isOrchWorkerId(modelId));
+      const hasPlanHandoffTool = tools.includes('exit_plan_mode') || tools.includes('enter_plan_mode');
+
+      if (!plannerStep && !workerStep && uiLabel) {
+        lastConcreteModel = formatModelDisplayName(uiLabel);
+      } else if (!plannerStep && !workerStep && modelId) {
+        lastConcreteModel = formatRawModelId(modelId);
+      } else if (!plannerStep && !workerStep && fallbackModel && !isOrchPlannerLabel(fallbackModel)) {
+        lastConcreteModel = formatModelDisplayName(fallbackModel);
+      }
 
       if (plannerStep) {
+        explicitOrch = true;
         active = true;
-        const base = extractPlannerBase(uiLabel, modelId);
-        if (base) plannerBase = base;
+        const info = extractPlannerInfo(uiLabel, modelId);
+        if (info) {
+          plannerBase = info.base;
+          plannerFullModel = info.fullModel;
+        }
         if (phase === 'exec') phase = 'review';
+        awaitingReview = false;
       } else if (workerStep) {
         active = true;
         phase = 'exec';
+        awaitingReview = false;
+      } else if (hasPlanHandoffTool) {
+        active = true;
+        if (phase !== 'exec') {
+          const info = extractPlannerInfo(uiLabel || lastConcreteModel || fallbackModel, modelId);
+          if (info) {
+            plannerBase = info.base;
+            plannerFullModel = info.fullModel;
+          }
+        }
+      } else if (awaitingReview && phase === 'review') {
+        active = true;
+        const info = extractPlannerInfo(uiLabel || lastConcreteModel || fallbackModel, modelId);
+        if (info) {
+          plannerBase = info.base;
+          plannerFullModel = info.fullModel;
+        }
+        awaitingReview = false;
       } else if (uiLabel && phase !== 'exec') {
+        explicitOrch = false;
         active = false;
       }
 
-      if (tools.includes('exit_plan_mode') || tools.includes('enter_plan_mode')) {
-        active = true;
+      if (!plannerBase) {
+        const info = extractPlannerInfo(lastConcreteModel || fallbackModel);
+        if (info) {
+          plannerBase = info.base;
+          plannerFullModel = info.fullModel;
+        } else {
+          plannerBase = 'Carbon';
+          plannerFullModel = 'Gemini 4 Carbon';
+        }
       }
 
       if (!active) {
@@ -251,19 +379,23 @@ function createOrchTracker() {
           ? 'to_plan'
           : null;
 
-      let engine = plannerBase || 'Carbon';
-      let pricingModel = engine;
+      let engine = plannerFullModel ? shortEngineName(plannerFullModel, true) : (plannerBase || 'Carbon');
+      let pricingModel = plannerFullModel || plannerBase || 'Gemini 4 Carbon';
+      let execModel = null;
 
       if (currentPhase === 'exec') {
         const concreteExec = extractWorkerModel(uiLabel, modelId);
-        engine = concreteExec ? shortEngineName(concreteExec) : 'Exec';
+        engine = concreteExec ? shortEngineName(concreteExec, true) : 'Exec';
         pricingModel = concreteExec || 'Gemini Flash';
+        execModel = pricingModel;
       }
 
       if (handoff === 'to_exec') {
         phase = 'exec';
+        awaitingReview = false;
       } else if (handoff === 'to_plan') {
         phase = 'review';
+        awaitingReview = true;
       }
 
       return {
@@ -271,6 +403,8 @@ function createOrchTracker() {
           phase: currentPhase,
           engine,
           plannerBase,
+          plannerModel: plannerFullModel || `Orchestrator (${plannerBase})`,
+          execModel,
           handoff,
         },
         displayModel: `Orchestrator (${plannerBase})`,

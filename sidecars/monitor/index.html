@@ -385,7 +385,8 @@
       const escapeHtml = (str) => String(str || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
       if (orch || /orchestrator/i.test(m)) {
-        const mainBadge = `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-xs font-semibold whitespace-nowrap orch-pill" title="${safe}">🎛️ ${safe}</span>`;
+        const mainTitle = orch?.plannerModel && orch.plannerModel !== m ? `${safe} · 规划模型 ${escapeHtml(orch.plannerModel)}` : safe;
+        const mainBadge = `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-xs font-semibold whitespace-nowrap orch-pill" title="${mainTitle}">🎛️ ${safe}</span>`;
         if (!orch) return mainBadge;
 
         let subCls = 'bg-amber-500/15 text-amber-300 border-amber-500/30';
@@ -617,7 +618,7 @@
       const legendEl = document.getElementById('chart-speed-legend');
       if (legendEl) {
         legendEl.innerHTML = hasOrch
-          ? `<span class="w-2.5 h-2.5 rounded-sm bg-indigo-400 inline-block"></span> 规划 <span class="w-2.5 h-2.5 rounded-sm bg-cyan-400 inline-block ml-1"></span> 执行 (tok/s)`
+          ? `<span class="w-2.5 h-2.5 rounded-sm bg-indigo-400 inline-block"></span> 规划 <span class="w-2.5 h-2.5 rounded-sm bg-purple-400 inline-block ml-1"></span> 复盘 <span class="w-2.5 h-2.5 rounded-sm bg-cyan-400 inline-block ml-1"></span> 执行 (tok/s)`
           : `<span class="w-2.5 h-2.5 rounded-sm bg-sky-400 inline-block"></span> 纯生成 (tok/s)`;
       }
 
@@ -628,7 +629,7 @@
         const by = padT + plotH - barH;
         let color = speed >= 45 ? '#38bdf8' : speed >= 25 ? '#0284c7' : speed > 0 ? '#64748b' : '#334155';
         if (s.orch) {
-          color = s.orch.phase === 'exec' ? '#22d3ee' : '#818cf8';
+          color = s.orch.phase === 'exec' ? '#22d3ee' : s.orch.phase === 'review' ? '#c084fc' : '#818cf8';
         }
 
         const ctxY = padT + plotH - (s.contextTokens / maxCtx) * plotH;
@@ -636,7 +637,7 @@
 
         const modelName = s.model || 'Default';
         const phaseTag = s.orch
-          ? `[Orchestrator · ${s.orch.phase === 'exec' ? '执行' : s.orch.phase === 'review' ? '复盘' : '规划'}(${s.orch.engine})]`
+          ? `[Orchestrator(${s.orch.plannerBase || 'Carbon'}) · ${s.orch.phase === 'exec' ? '执行' : s.orch.phase === 'review' ? '复盘' : '规划'}(${s.orch.engine})]`
           : `[${modelName}]`;
         const costStr = s.quota ? fmtUsd(s.quota.costUsd, 4) : '--';
         const label = `#${s.stepIndex} ${phaseTag} | 纯生成: ${s.decodeTokPerSec ?? '--'} tok/s | 额度: ${costStr} (折 ${fmtCompact(s.quota?.equivTokens)}) | 输出: ${s.outputTokens} tok`;
@@ -798,12 +799,19 @@
       const sum = data.summary || {};
       const modelBadge = document.getElementById('model-badge');
       const curModel = data.currentModel || 'Default';
-      if (/orchestrator/i.test(curModel)) {
+      const stepsArr = data.steps || [];
+      const lastStep = stepsArr.length > 0 ? stepsArr[stepsArr.length - 1] : null;
+      if (/orchestrator/i.test(curModel) || lastStep?.orch) {
         modelBadge.className = 'text-xs px-2.5 py-0.5 rounded-full border font-semibold truncate orch-pill';
-        modelBadge.textContent = `🎛️ ${curModel}`;
+        if (lastStep?.orch) {
+          const pIcon = lastStep.orch.phase === 'exec' ? '⚡ 执行' : lastStep.orch.phase === 'review' ? '🔍 复盘' : '🧭 规划';
+          modelBadge.textContent = `🎛️ ${curModel} · ${pIcon}: ${lastStep.orch.engine}`;
+        } else {
+          modelBadge.textContent = `🎛️ ${curModel}`;
+        }
         const os = sum.orchSummary;
         modelBadge.title = os
-          ? `${curModel} · 规划/复盘 ${os.planSteps + os.reviewSteps} 步 / 执行 ${os.execSteps} 步`
+          ? `${curModel} · 规划 ${os.planSteps} 步 / 复盘 ${os.reviewSteps} 步 / 执行 ${os.execSteps} 步`
           : curModel;
       } else {
         let cls = 'bg-sky-500/15 text-sky-400 border-sky-500/25';
